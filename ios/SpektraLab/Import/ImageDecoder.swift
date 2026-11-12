@@ -15,7 +15,10 @@
 //  rather than silently rendered wrong.
 
 import Foundation
-import CoreImage
+// The iOS 27 SDK marks CoreImage's shared types Sendable; older SDKs do not.
+// Xcode 16 / iOS 18.5 with Swift 6 strict concurrency otherwise rejects them,
+// so treat the module's missing annotations as a legacy import detail.
+@preconcurrency import CoreImage
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -223,7 +226,10 @@ enum ImageDecoder {
         }
     }()
 
-    private static let context = CIContext(options: [
+    // CIContext is documented as safe to share between threads, but SDKs
+    // before iOS 26 do not declare it Sendable. The explicit opt-out keeps
+    // Swift 6 strict concurrency happy on those SDKs without changing use.
+    private nonisolated(unsafe) static let context = CIContext(options: [
         .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) as Any,
         .workingFormat: CIFormat.RGBAh,
         .cacheIntermediates: false,
