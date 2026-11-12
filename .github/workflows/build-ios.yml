@@ -178,7 +178,9 @@ jobs:
           xcrun -sdk iphoneos metal --version \
             || xcodebuild -downloadComponent MetalToolchain
       - name: Engine kernels and resources
-        run: ios/Tools/build-engine.sh bundle
+        # Invoke through bash explicitly: a repo re-created on Windows has no
+        # Unix executable bits, and a bare path fails with "Permission denied".
+        run: bash ios/Tools/build-engine.sh bundle
       # The app icon is drawn by a Python script (Pillow), not shipped as an
       # asset, so it is generated before the project is regenerated. It lands
       # at `ios/SpektraLab/Assets.xcassets/AppIcon.appiconset`, which
