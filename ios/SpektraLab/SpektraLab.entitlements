@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The app has no App Sandbox entitlement of its own on iOS: the
+	     sandbox is the platform's, and the app writes only to its own
+	     container and to the photo library. -->
+</dict>
+</plist>

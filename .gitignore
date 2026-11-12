@@ -1,0 +1,27 @@
+# The engine is upstream's, and the CI fetches it:
+#   https://github.com/JamesQiu2005/SpektraLab
+# It is not in this repository, so the two cannot drift apart.
+engine/
+
+# The engine's kernels and baked resources, produced by
+# ios/Tools/build-engine.sh. 9.4 MB of measured tables and a compiled
+# metallib are build products, not sources.
+/ios/SpektraLab/Resources/engine/
+/ios/SpektraLab/Resources/engine-assets.bin
+/ios/SpektraLab/AppIcon60x60@*.png
+/ios/SpektraLab.xcodeproj/project.xcworkspace/
+
+# Build products
+build/
+DerivedData/
+*.ipa
+*.xcarchive/
+*.dSYM/
+/work/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

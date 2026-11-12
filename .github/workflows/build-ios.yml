@@ -1,0 +1,645 @@
+#  Build the iOS app and an installable IPA.
+#
+#  **Why a workflow at all.** An iOS app is compiled by Xcode, which runs on
+#  macOS, and an IPA is signed with a certificate that must not be in the
+#  repository. Both are fine on a GitHub runner: the runner is a Mac, and the
+#  certificate arrives as an encrypted secret.
+#
+#  What this job does, in order:
+#
+#    1. fetch the upstream engine,
+#    2. patch the engine for iOS (`tools/apply-ios-patch.py`),
+#    3. compile the engine's Metal kernels for iOS and bake its resources,
+#    4. draw the app icon,
+#    5. generate the Xcode project and build it for a device,
+#    6. export the IPA and hand it over as an artifact.
+#
+#  The secrets it needs -- all optional, and the job says so when one is
+#  missing:
+#
+#    IOS_CERTIFICATE_P12        base64 of the .p12 (a development certificate)
+#    IOS_CERTIFICATE_PASSWORD   its password
+#    IOS_CERTIFICATE_IDENTITY   the certificate's name, e.g.
+#                               "Apple Development: Name (TEAMID)"
+#    IOS_PROVISIONING_PROFILE   base64 of the .mobileprovision
+#    IOS_PROVISIONING_PROFILE_NAME  its name, as it appears in Xcode
+#    IOS_TEAM_ID                the ten-character team id
+#    IOS_BUNDLE_ID              the bundle id the profile is for
+#
+#  Without them the job still builds and signs *ad-hoc*, which produces an
+#  IPA that a device will refuse to install -- so the job checks and says so
+#  rather than handing over something that looks finished and is not.
+#
+#  `tools/set-github-secrets.py` sets all seven from the files on disk.
+name: Build IPA (iOS 16)
+on:
+  push:
+    branches: [main]
+    # Documentation does not need forty minutes on a macOS runner, and
+    # `cancel-in-progress` above means a typo in the README would otherwise
+    # cancel a build that is about to finish.
+    paths-ignore:
+      - 'README.md'
+      - 'HANDOFF.md'
+      - 'AGENTS.md'
+      - 'ARCHITECTURE.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+  # A manual run can pick a different runner. `xcode-27` is the label the
+  # upstream project used for its iOS 27 SDK build; a normal public fork has
+  # no such label, so the default is the standard (free) macos-15 image.
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner label'
+        required: false
+        default: 'macos-15'
+        type: string
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ipa:
+    # This build's deployment target is iOS 16.0, so it no longer needs the
+    # iOS 27 SDK: Xcode 16.4 / iOS 18 on the standard macos-15 image is
+    # enough, and the compatibility layer in ContentView.swift hides the
+    # Liquid Glass symbols from older toolchains. Pass `runner: xcode-27`
+    # on a manual run to build with the newer SDK instead.
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
+    timeout-minutes: 45
+    # The rolling release at the end of the job is written with the workflow's
+    # own token, and `contents: write` is what lets it create one; a
+    # repository whose default is read-only would otherwise fail with a 403
+    # on a step that has nothing to do with the build.
+    permissions:
+      contents: write
+    # Job-level environment: the bundle id and the upstream commit are
+    # configuration, not secrets, and every step reads them from here.
+    #
+    # The HAVE_* flags are there because GitHub's expression evaluator does
+    # not have `secrets` in a step's `if:` -- only in a step's `env:`. So
+    # the question "is the certificate there?" has to be asked of an
+    # environment variable rather than of the secret store.
+    env:
+      IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+      UPSTREAM_COMMIT: 02d82b56cf65f0f8e802a708612edc4e9a4790af
+      BUNDLE_ID_DEFAULT: com.hanze.spektralab
+      HAVE_CERT: ${{ secrets.IOS_CERTIFICATE_P12 != '' }}
+      HAVE_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE != '' }}
+      HAVE_TEAM: ${{ secrets.IOS_TEAM_ID != '' }}
+      HAVE_IDENTITY: ${{ secrets.IOS_CERTIFICATE_IDENTITY != '' }}
+      HAVE_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          # An iOS 16.0 deployment target builds fine against any recent iOS
+          # SDK. Prefer Xcode 27.2 when the runner has it (that is the SDK the
+          # upstream build used), but do not require it: macos-15 ships
+          # Xcode 16.x with the iOS 18 SDK, which is enough here. Sources
+          # guard Liquid Glass with `#if compiler(>=6.2)` and
+          # `if #available(iOS 26.0, *)`, so the symbols vanish on the older
+          # toolchain instead of breaking the build.
+          for candidate in /Applications/Xcode_27.2*.app /Applications/Xcode.app /Applications/Xcode*.app; do
+            [ -d "$candidate/Contents/Developer" ] || continue
+            sudo xcode-select -s "$candidate/Contents/Developer"
+            echo "using $candidate"
+            xcodebuild -version
+            xcrun -sdk iphoneos --show-sdk-version
+            exit 0
+          done
+          echo "error: no usable Xcode installation" >&2
+          ls -1 /Applications | grep '^Xcode' || true
+          exit 1
+      # The engine is upstream's, and it is not in this repository: this one
+      # carries the app, the patch and the build scripts, and the engine comes
+      # from the upstream project at a pinned commit.
+      #
+      # Through the API rather than through git. Four different ways of
+      # fetching the tree -- a tarball, a shallow clone, a partial clone and
+      # a full clone -- all produced a tree with an `engine` directory and no
+      # `resources` in it, while the tree API says the commit has 33 blobs
+      # under `engine/resources` including the 9.4 MB
+      # `spektrafilm_constants.bin`. So the API is what asks for the tree
+      # and what asks for each file, and it checks what came back.
+      - name: Fetch the upstream engine
+        env:
+          # The runner's own token, which can read this public repository and
+          # nothing else. It is here because the API's **anonymous** limit is
+          # 60 requests an hour and the engine needs a few hundred: a request
+          # over the limit does not fail, it returns a tree with whatever was
+          # not fetched missing from it, which is a very quiet way to get a
+          # half an engine.
+          #
+          # With a token the limit is 5000 an hour.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "fetching the engine at $UPSTREAM_COMMIT"
+          rm -rf engine
+          python3 tools/fetch-engine.py \
+            JamesQiu2005/SpektraLab "$UPSTREAM_COMMIT" .
+      # The product profiles -- the black-and-white stocks measured for this
+      # project -- are in the upstream tree already (engine/resources_product),
+      # so the tarball above brought them. This step is a check, not a fetch:
+      # it says so when they are missing rather than letting the build fail
+      # later with a stock that is not in the catalogue.
+      - name: Check the product profiles
+        run: |
+          set -euo pipefail
+          if [ ! -d engine/resources_product/profiles ]; then
+            echo "::warning::the upstream tree has no engine/resources_product/profiles"
+            echo "::warning::the four black-and-white stocks will be missing from the app"
+            exit 0
+          fi
+          count="$(ls engine/resources_product/profiles | wc -l | tr -d ' ')"
+          echo "product profiles: $count"
+          if [ "$count" -lt 6 ]; then
+            echo "::warning::expected 6 product profiles, found $count"
+          fi
+      - name: Patch the engine for iOS
+        run: python3 tools/apply-ios-patch.py engine
+      # Core Image's iOS camera table is smaller than macOS's, and some
+      # formats only expose an embedded preview. The app falls back to the
+      # same pinned LibRaw release the Mac/Windows build uses, so that source
+      # has to exist before the Xcode project is generated. `gen-project.py`
+      # fails on purpose if it is missing: silently omitting LibRaw produces a
+      # project that compiles Swift but fails at link time thousands of lines
+      # later.
+      - name: Fetch LibRaw
+        run: bash engine/setup-libraw.sh
+      # From Xcode 16 the Metal compiler is a separate component on some
+      # images; asking for it before compiling the kernels turns a confusing
+      # failure into a line of output.
+      - name: Metal toolchain
+        run: |
+          xcrun -sdk iphoneos metal --version \
+            || xcodebuild -downloadComponent MetalToolchain
+      - name: Engine kernels and resources
+        run: ios/Tools/build-engine.sh bundle
+      # The app icon is drawn by a Python script (Pillow), not shipped as an
+      # asset, so it is generated before the project is regenerated. It lands
+      # at `ios/SpektraLab/Assets.xcassets/AppIcon.appiconset`, which
+      # `gen-project.py` then carries as a compiled asset catalog. A missing
+      # Pillow is not fatal: the build continues and ships with no custom
+      # icon rather than failing.
+      # The app fetches these on first launch; the IPA deliberately does not
+      # carry them. A 15 MB payload inside the .app makes a side-loading
+      # installer fail when it copies the unpacked IPA to its fixed `App.app`,
+      # and all it reports is "Failed to get bundle ID". The URL in
+      # `EngineBridge.remoteAssets` points at this tag and file name.
+      - name: Publish the engine assets
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="build/engine-assets.bin"
+          if [ ! -f "$asset" ]; then
+            echo "::error::build-engine.sh did not produce $asset"
+            exit 1
+          fi
+          echo "asset: $(du -h "$asset" | cut -f1)"
+          gh release view engine-assets >/dev/null 2>&1 || gh release create engine-assets --title "Engine assets" --notes "Baked engine resources, downloaded by the app on first launch. The IPA does not carry them: a 15 MB payload inside the .app makes a side-loading installer fail with Failed to get bundle ID."
+          gh release upload engine-assets "$asset" --clobber
+          echo "published to the engine-assets release"
+
+      - name: App icon
+        run: |
+          set -euo pipefail
+          # A virtual environment, because the runner's Python is
+          # Homebrew's and refuses a `pip install` into itself: PEP 668 says
+          # an externally-managed environment is not to be modified, and
+          # `pip install Pillow` there is an error rather than a warning.
+          # `--break-system-packages` would work and is not worth it.
+          if ! python3 -c "import PIL" 2>/dev/null; then
+            python3 -m venv /tmp/icon-venv
+            /tmp/icon-venv/bin/pip install --quiet Pillow
+            /tmp/icon-venv/bin/python tools/make-app-icon.py
+          else
+            python3 tools/make-app-icon.py
+          fi
+      # The project file is generated from the filesystem, like the upstream
+      # macOS project generates its own. Generating it here means the CI
+      # builds what is on disk rather than what was committed.
+      # `CFBundleIconFiles` names `AppIcon60x60`, and iOS looks that up as
+      # `AppIcon60x60@2x.png` / `@3x.png` in the bundle root. The working
+      # third-party build ships exactly these two files, so the icon does not
+      # depend on actool's CFBundleIcons surviving the Info.plist merge (it
+      # does not -- builtin-linkAssetCatalog rewrites that dictionary).
+      - name: Stage the icon PNGs
+        run: |
+          set -euo pipefail
+          set_src=ios/SpektraLab/Assets.xcassets/AppIcon.appiconset
+          cp "$set_src/icon-60@2x.png" ios/SpektraLab/AppIcon60x60@2x.png
+          cp "$set_src/icon-60@3x.png" ios/SpektraLab/AppIcon60x60@3x.png
+          ls -l ios/SpektraLab/AppIcon60x60@*.png
+
+      - name: Generate the Xcode project
+        run: python3 ios/Tools/gen-project.py
+      # Cheap, platform-independent guard: catch an unguarded iOS 17/26 API or
+      # a deployment target that drifted back to 27.0 before spending macOS
+      # minutes on a build that would crash on the target devices anyway.
+      - name: Verify the iOS 16 compatibility layer
+        run: python3 ios/Tools/check-ios16-compat.py
+      # --- signing ---------------------------------------------------------
+      #
+      # The certificate and the profile arrive as base64 in secrets and are
+      # installed into the runner's keychain. The steps are conditional on the
+      # secret being there: a repository that has not set them up yet still
+      # gets a build, and the warning at the end says what is missing.
+      - name: Install the signing certificate
+        if: ${{ env.HAVE_CERT == 'true' }}
+        env:
+          CERT_B64: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$CERT_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$CERT_PASSWORD" build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-keychain-settings -lut 21600 build.keychain
+          security list-keychains -d user -s build.keychain login.keychain-db
+          echo "the certificate is installed:"
+          security find-identity -v -p codesigning
+      - name: Install the provisioning profile
+        if: ${{ env.HAVE_PROFILE == 'true' }}
+        env:
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          echo "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          echo "the profile is installed:"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" \
+            | plutil -extract Name raw - 2>/dev/null || echo "  (name not printed)"
+      - name: Say what is missing, if anything
+        run: |
+          echo "certificate:    ${HAVE_CERT}"
+          echo "identity:       ${HAVE_IDENTITY}"
+          echo "profile:        ${HAVE_PROFILE}"
+          echo "profile name:   ${HAVE_PROFILE_NAME}"
+          echo "team id:        ${HAVE_TEAM}"
+          echo "bundle id:      ${IOS_BUNDLE_ID:-$BUNDLE_ID_DEFAULT}"
+          if [ "${HAVE_CERT}" != "true" ] || [ "${HAVE_PROFILE}" != "true" ] \
+             || [ "${HAVE_TEAM}" != "true" ] || [ "${HAVE_IDENTITY}" != "true" ] \
+             || [ "${HAVE_PROFILE_NAME}" != "true" ]; then
+            echo ""
+            echo "::warning::The IPA will be signed ad-hoc and will NOT install on a device."
+            echo "::warning::Add these repository secrets for an installable IPA:"
+            echo "::warning::  IOS_CERTIFICATE_P12, IOS_CERTIFICATE_PASSWORD,"
+            echo "::warning::  IOS_CERTIFICATE_IDENTITY, IOS_PROVISIONING_PROFILE,"
+            echo "::warning::  IOS_PROVISIONING_PROFILE_NAME, IOS_TEAM_ID, IOS_BUNDLE_ID"
+            echo "::warning::tools/set-github-secrets.py sets all seven from the files."
+          fi
+      # --- build -----------------------------------------------------------
+      #
+      # The project is regenerated with the signing settings, so the same
+      # committed file builds both signed and unsigned.
+      #
+      # `-scheme`, because `xcodebuild` insists on one for anything that
+      # names an output path: "-archivePath is required when not using
+      # -exportArchive", and `-derivedDataPath` wants one too. The scheme is
+      # written by `ios/Tools/gen-project.py` next to the project, because a
+      # generated project has no scheme unless something writes one.
+      - name: Build
+        env:
+          SPEKTRAFILM_SIGN_IDENTITY: ${{ secrets.IOS_CERTIFICATE_IDENTITY }}
+          SPEKTRAFILM_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          SPEKTRAFILM_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+          SPEKTRAFILM_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          python3 ios/Tools/gen-project.py
+          mkdir -p build build/ipa
+          # Archive only with real signing material. `xcodebuild archive`
+          # writes the .xcarchive's own Info.plist by reading the bundle id
+          # and the team out of the app's code signature; without a
+          # certificate and a profile there is no signature to read, and it
+          # fails with "Archive Missing Bundle Identifier" even though the
+          # app's Info.plist is correct. Without signing material, build the
+          # .app directly and package it by hand in the next step.
+          SIGNED=false
+          if [ "$HAVE_CERT" = "true" ] && [ "$HAVE_PROFILE" = "true" ] \
+             && [ "$HAVE_TEAM" = "true" ] && [ "$HAVE_PROFILE_NAME" = "true" ]; then
+            SIGNED=true
+          fi
+          if [ "$SIGNED" = true ]; then
+            echo "BUILD_MODE=archive" >> "$GITHUB_ENV"
+            set -o pipefail
+            xcodebuild -project ios/SpektraLab.xcodeproj \
+              -scheme SpektraLab \
+              -configuration Release \
+              -derivedDataPath build/DerivedData \
+              -destination "generic/platform=iOS" \
+              -archivePath build/SpektraLab.xcarchive \
+              archive 2>&1 | tee build/xcodebuild.log
+            echo "the archive is at build/SpektraLab.xcarchive"
+          else
+            echo "BUILD_MODE=package" >> "$GITHUB_ENV"
+            # No signing material, but the bundle is still sealable: the
+            # generated project asks for `CODE_SIGN_IDENTITY "-"` with no
+            # profile, which is ad-hoc, and Xcode's CodeSign phase is the only
+            # thing that seals an iOS bundle carrying `Assets.car` and a
+            # root-level `default.metallib` -- a hand-run codesign refuses
+            # exactly that combination. Ask Xcode to do it.
+            #
+            # `AD_HOC_CODE_SIGNING_ALLOWED=YES` is the part that makes it
+            # happen: for an iOS device target Xcode 16 defaults that setting to
+            # NO, and with identity "-" and no team it then skips the CodeSign
+            # phase quietly -- the build succeeds, the .app ships with no
+            # `_CodeSignature` at all, and every tool downstream reports
+            # "Missing bundle ID" because the bundle id is read from a signature
+            # that is not there.
+            #
+            # If the seal still fails, rebuild unsigned rather than lose the
+            # run: the artifact matters more than the seal, and the packaging
+            # step reports which of the two the bundle got.
+            set -o pipefail
+            if xcodebuild -project ios/SpektraLab.xcodeproj \
+              -scheme SpektraLab \
+              -configuration Release \
+              -derivedDataPath build/DerivedData \
+              -destination "generic/platform=iOS" \
+              build AD_HOC_CODE_SIGNING_ALLOWED=YES 2>&1 | tee build/xcodebuild.log
+            then
+              echo "the build finished; the packaging step reports whether the bundle was sealed"
+            else
+              echo "::warning::Xcode could not build with the ad-hoc seal; rebuilding unsigned"
+              xcodebuild -project ios/SpektraLab.xcodeproj \
+                -scheme SpektraLab \
+                -configuration Release \
+                -derivedDataPath build/DerivedData \
+                -destination "generic/platform=iOS" \
+                build CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/xcodebuild-unsigned.log
+              echo "built the unsigned .app"
+            fi
+          fi
+      - name: Package the IPA
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+          BUNDLE_ID_DEFAULT: com.hanze.spektralab
+        run: |
+          set -euo pipefail
+          bundle="${IOS_BUNDLE_ID:-$BUNDLE_ID_DEFAULT}"
+          if [ "$BUILD_MODE" = "archive" ]; then
+            # Written by plistlib rather than by a heredoc: the heredoc would
+            # inherit this block's indentation, and an XML declaration that is
+            # not at the first byte of the file is not an XML declaration.
+            python3 - <<'PY'
+          import os, plistlib
+          bundle = os.environ.get("IOS_BUNDLE_ID") or os.environ["BUNDLE_ID_DEFAULT"]
+          options = {
+              "method": "development",
+              "teamID": os.environ["IOS_TEAM_ID"],
+              "signingStyle": "manual",
+              "provisioningProfiles": {bundle: os.environ["IOS_PROFILE_NAME"]},
+          }
+          with open("build/ExportOptions.plist", "wb") as handle:
+              plistlib.dump(options, handle)
+          PY
+            set -o pipefail
+            xcodebuild -exportArchive \
+              -archivePath build/SpektraLab.xcarchive \
+              -exportOptionsPlist build/ExportOptions.plist \
+              -exportPath build/ipa \
+              2>&1 | tee build/export.log
+            # One name for both paths, so the release asset and the link in
+            # the README do not change with the signing path.
+            ipa=$(find build/ipa -maxdepth 1 -name '*.ipa' -print -quit)
+            if [ "$ipa" != "build/ipa/SpektraLab.ipa" ]; then
+              mv "$ipa" build/ipa/SpektraLab.ipa
+            fi
+            ls -la build/ipa
+            exit 0
+          fi
+          # The unsigned path: take the built .app, check it is a real bundle,
+          # ad-hoc sign it and zip it into Payload/. ditto (not zip) because
+          # it keeps the bundle's metadata and symlinks the way iOS expects.
+          app=$(find build/DerivedData/Build/Products/Release-iphoneos \
+                  -maxdepth 1 -name 'SpektraLab.app' -print -quit)
+          if [ -z "$app" ]; then
+            echo "::error::no Release-iphoneos/SpektraLab.app was built"
+            ls -la build/DerivedData/Build/Products || true
+            exit 1
+          fi
+          echo "packaging $app"
+          python3 - "$app/Info.plist" <<'PY'
+          import plistlib, sys
+          d = plistlib.load(open(sys.argv[1], "rb"))
+          for k in ("CFBundleIdentifier", "CFBundleExecutable",
+                    "CFBundleVersion", "CFBundleShortVersionString"):
+              print(f"  {k} = {d.get(k)!r}")
+          PY
+          # `ditto` with the fork/attribute flags rather than `cp -R`: the copy
+          # would inherit the build's extended attributes, and the archive step
+          # writes them back out as AppleDouble `._*` files next to the real
+          # ones -- detritus a signing service counts as part of the bundle,
+          # and detritus codesign itself refuses to seal. The find is a check
+          # that none survived, not a cleanup.
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          ditto --norsrc --noextattr --noqtn "$app" build/Payload/SpektraLab.app
+          find build/Payload -name '._*' -print -quit
+          app_dir=build/Payload/SpektraLab.app
+          exe=$(plutil -extract CFBundleExecutable raw - < "$app_dir/Info.plist")
+          # Every file in a bundle except the main executable is data. Xcode's
+          # metal and asset-compile steps leave `default.metallib` and
+          # `Assets.car` with the executable bit set, and codesign reads an
+          # executable file inside a bundle as *nested code* -- unsigned nested
+          # code is what it refuses to seal ("code object is not signed at all /
+          # In subcomponent: ..."). Clearing the bit is the fix; signing those
+          # two files by hand only moves the refusal to the next one.
+          find "$app_dir" -type f -exec chmod a-x {} +
+          chmod a+x "$app_dir/$exe"
+          # Info.plist goes XML before the seal, not after: rewriting a sealed
+          # file breaks the seal. iOS reads either form, but a service that
+          # scrapes the bundle id out of the file as text reads nothing from a
+          # binary plist and reports "Missing bundle ID".
+          plutil -convert xml1 "$app_dir/Info.plist"
+          echo "Info.plist starts with: $(head -c 38 "$app_dir/Info.plist")"
+          # Ship an unsealed copy as well. SideStore/AltStore re-sign with
+          # `ldid`, which rewrites only the main executable; an ad-hoc seal
+          # made here also covered the metallibs and `Assets.car`, so after a
+          # re-sign the bundle and its `_CodeSignature` disagree and the
+          # install dies at IXPlaceholder with "Failed to get bundle ID".
+          # The unsealed IPA is what a re-signer wants: nothing to inherit.
+          # `zip`, not `ditto -c -k`: ditto streams and therefore sets the
+          # data-descriptor flag on every file entry, which some extractors --
+          # including ones on iOS -- mishandle. What goes missing first is
+          # `Info.plist`, and the installer then reports "Missing bundle ID".
+          # `repack-ipa.py`, not `zip`: `zip` and `ditto` write a 24-byte extra
+          # field (UT + ux) on every entry and stamp create_version 30, which
+          # SideStore's unzip rejects with "Archive appears to be corrupt" --
+          # or, with ditto, unpacks partway and reports the useless
+          # "Failed to get bundle ID". Python's zipfile writes none of that.
+          python3 ios/Tools/repack-ipa.py build build/ipa/SpektraLab-unsigned.ipa
+          # A bundle with no `_CodeSignature` is an incomplete app bundle: a
+          # re-signer reads the identifier out of the existing signature to know
+          # what it is replacing, and an installer handed a bare directory
+          # reports the bundle id as missing. Xcode skips its CodeSign phase
+          # without signing material (and `AD_HOC_CODE_SIGNING_ALLOWED` does not
+          # change that), so the seal is made here instead.
+          # Best-effort only. A re-signer replaces this signature anyway, and
+          # an installer reads the bundle id from Info.plist -- so a seal that
+          # cannot be made must never stop the IPA from being published.
+          if [ -d "$app_dir/Frameworks" ]; then
+            find "$app_dir/Frameworks" -depth \
+              \( -name '*.framework' -o -name '*.appex' -o -name '*.dylib' \) -print0 |
+            while IFS= read -r -d '' nested; do
+              codesign --force --sign - --timestamp=none "$nested" || true
+            done
+          fi
+          # `MTLB` is not a Mach-O header, but codesign counts a `.metallib`
+          # as a code object and will not seal the app while one is unsigned
+          # ("code object is not signed at all / In subcomponent: ..."). Seal
+          # them first; clearing the executable bit does not help, because the
+          # decision is made on the file rather than its mode.
+          find "$app_dir" -name '*.metallib' -print0 |
+          while IFS= read -r -d '' lib; do
+            echo "  sealing $(basename "$lib")"
+            codesign --force --sign - --timestamp=none "$lib" 2>&1 | sed 's/^/    /' || true
+          done
+          # `--deep` seals every nested code object the bundle contains in one
+          # pass -- the metallibs, `Assets.car`, anything a future Xcode adds.
+          # Hand-listing them was whack-a-mole: sealing the metallibs simply
+          # moved the refusal on to `Assets.car`.
+          # `--identifier` so the seal carries `com.hanze.spektralab`, the
+          # same string as CFBundleIdentifier. Without it codesign invents
+          # `SpektraLab-<uuid>`, and a re-signer that reads the identifier
+          # out of the existing signature then acts on the wrong one.
+          app_id=$(plutil -extract CFBundleIdentifier raw - < "$app_dir/Info.plist")
+          if codesign --force --deep --sign - --timestamp=none \
+               --identifier "$app_id" "$app_dir" 2>&1 | sed 's/^/  /'
+          then
+            echo "sealed the bundle ad-hoc"
+          else
+            echo "::warning::could not seal the bundle ad-hoc; the IPA is still re-signable by SideStore/AltStore, which only needs Payload/*.app/Info.plist"
+          fi
+          # The identifier the seal carries is the one an installer will look
+          # for, so it has to be the same string as CFBundleIdentifier.
+          bundle_id=$(plutil -extract CFBundleIdentifier raw - < "$app_dir/Info.plist")
+          # `codesign -dv` and `codesign --verify` both exit non-zero on an
+          # unsigned bundle; under `set -e` that aborted packaging of an IPA
+          # whose Info.plist was already correct. Neither is a reason to fail.
+          sealed_id=$( { codesign -dv --verbose=4 "$app_dir" 2>&1 || true; } \
+                       | sed -n 's/^Identifier=//p')
+          echo "bundle id:   $bundle_id"
+          echo "sealed id:   ${sealed_id:-<unsigned>}"
+          { codesign --verify --verbose=2 "$app_dir" 2>&1 || true; } | sed 's/^/  /'
+          if [ "$sealed_id" = "$bundle_id" ]; then
+            echo "the seal and Info.plist agree"
+          else
+            echo "::warning::the seal identifies '${sealed_id:-<none>}' but CFBundleIdentifier is '$bundle_id'"
+          fi
+          ls -la "$app_dir/_CodeSignature" || true
+          # `--norsrc --noextattr --noqtn`: sealing writes extended
+          # attributes onto the metallibs and `Assets.car`, and a plain
+          # `ditto -c -k` turns each one into an AppleDouble `._*` entry in
+          # the zip. On the device those unpack as real files beside the
+          # originals, and the seal then does not match what is there.
+          python3 ios/Tools/repack-ipa.py build build/ipa/SpektraLab.ipa
+          ls -la build/ipa
+          # Check the archive itself rather than the staging directory: the
+          # thing a signing service chokes on is what is inside the zip, and a
+          # `Payload/` path that is one level off looks fine right up until it
+          # does not install.
+          # Guard against a regression to a streaming zipper: a data
+          # descriptor on any entry is what broke the iOS install.
+          python3 - build/ipa/SpektraLab-unsigned.ipa build/ipa/SpektraLab.ipa <<'PY'
+          import sys, zipfile
+          for path in sys.argv[1:]:
+              z = zipfile.ZipFile(path)
+              bad = [i.filename for i in z.infolist() if i.flag_bits & 0x08]
+              if bad:
+                  print(f"::error file={path}::{len(bad)} entries carry a data "
+                        f"descriptor, e.g. {bad[0]}")
+                  sys.exit(1)
+              print(f"{path}: {len(z.infolist())} entries, none with a data descriptor")
+          PY
+          unzip -l build/ipa/SpektraLab.ipa | sed -n '1,5p'
+          unzip -p build/ipa/SpektraLab.ipa Payload/SpektraLab.app/Info.plist > build/shipped.plist
+          echo "shipped Info.plist starts with: $(head -c 38 build/shipped.plist)"
+          echo "shipped bundle id: $(plutil -extract CFBundleIdentifier raw - < build/shipped.plist)"
+          echo "shipped executable: $(plutil -extract CFBundleExecutable raw - < build/shipped.plist)"
+          shipped_min=$(plutil -extract MinimumOSVersion raw - < build/shipped.plist)
+          echo "shipped minimum iOS: $shipped_min"
+          if [ "$shipped_min" != "16.0" ]; then
+            echo "::error::IPA declares MinimumOSVersion=$shipped_min; expected 16.0"
+            exit 1
+          fi
+          # Checked in the zip, not the staging directory: this is the file a
+          # re-signer and an installer each look for, and a seal that did not
+          # make it into `Payload/` is the same as no seal at all.
+          if unzip -l build/ipa/SpektraLab.ipa | grep -q '_CodeSignature/CodeResources'
+          then
+            echo "the archive carries the code signature"
+          else
+            echo "::warning::the archive has no _CodeSignature; SideStore and other re-signers expect one"
+          fi
+          echo "::notice::build/ipa/SpektraLab.ipa is not device-installable as it stands: re-sign it with your own Apple ID (AltStore/Sideloadly/Xcode), or set the seven signing secrets to get a signed export."
+      - name: Upload the IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpektraLab-iOS16-IPA
+          path: build/ipa/*.ipa
+          if-no-files-found: warn
+          retention-days: 30
+      # A rolling release, so the link in the README always resolves. Run
+      # artifacts are pruned after `retention-days`, and a download link that
+      # 404s a month later is worse than no link at all.
+      #
+      # Each build replaces the previous one: `gh release create` cannot move
+      # an existing tag, so the release goes first and takes its tag with it.
+      # Only on `main`, and only when everything above succeeded -- a failed
+      # build must not be published as the latest good one.
+      - name: Publish the IPA
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          {
+            echo "由提交 \`${GITHUB_SHA}\` 构建（run ${GITHUB_RUN_NUMBER}）。"
+            echo "最低系统版本：**iOS 16.0**。iOS 26+ 保留原生 Liquid Glass，"
+            echo "iOS 16~25 使用材质回退界面。"
+            echo ""
+            echo "- \`SpektraLab-<提交号>.ipa\`：ad-hoc 封签版，给 Sideloadly / Xcode 用。"
+            echo "- \`SpektraLab-<提交号>-unsigned.ipa\`：**未签名版，给 SideStore / AltStore 用**。"
+            echo "  它们用 ldid 自己重签，未封签的 bundle 不会和重签结果冲突。"
+          } > "$notes"
+          # 文件名带提交号，而不是固定名：`releases/download/<tag>/<name>`
+          # 走 CDN，同名替换后一段时间内仍会返回旧文件。那正是「CI 已经修好、
+          # 装到手机上还是旧包」的成因。
+          tag="${GITHUB_SHA::7}"
+          mkdir -p build/release
+          cp build/ipa/SpektraLab.ipa          "build/release/SpektraLab-$tag.ipa"
+          cp build/ipa/SpektraLab-unsigned.ipa "build/release/SpektraLab-$tag-unsigned.ipa"
+          echo "publishing SpektraLab-$tag.ipa and SpektraLab-$tag-unsigned.ipa"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --title "SpektraLab 最新构建（${tag}）" \
+            --notes-file "$notes" \
+            "build/release/SpektraLab-$tag.ipa" \
+            "build/release/SpektraLab-$tag-unsigned.ipa"
+          gh release view latest --json url,assets \
+            --jq '.url, (.assets[] | "\(.name)  \(.size) bytes")'
+      - name: Upload the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/*.log
+          if-no-files-found: ignore
