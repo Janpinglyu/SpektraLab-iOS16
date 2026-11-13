@@ -1170,11 +1170,14 @@ final class ViewModel: ObservableObject {
 
     private nonisolated static func eightBitImage(from image: CGImage) -> CGImage? {
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                                | CGBitmapInfo.byteOrder32Little.rawValue)
+        // CGContext derives bitsPerPixel from bitsPerComponent + bitmapInfo;
+        // this initialiser has no explicit bitsPerPixel parameter.
         guard let context = CGContext(data: nil,
                                       width: image.width, height: image.height,
-                                      bitsPerComponent: 8, bitsPerPixel: 32,
-                                      bytesPerRow: 0, space: space,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space,
                                       bitmapInfo: info.rawValue) else { return nil }
         context.draw(image, in: CGRect(x: 0, y: 0,
                                        width: image.width, height: image.height))
