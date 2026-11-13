@@ -25,6 +25,17 @@ struct SpektraLabApp: App {
             ContentView()
                 .environmentObject(model)
                 .preferredColorScheme(.dark)
+                // "Open in..." / the share sheet hands the file over here.
+                // CFBundleDocumentTypes in Info.plist makes the app appear as
+                // a destination; this is the receiving half. The library is
+                // the app's front door, so importing shows the new photo and
+                // the "已导入 N 张照片" toast as soon as the app opens.
+                .onOpenURL { url in
+                    guard url.isFileURL else { return }
+                    Task { @MainActor in
+                        await model.importFile(from: url)
+                    }
+                }
         }
     }
 }

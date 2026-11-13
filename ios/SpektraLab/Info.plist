@@ -32,6 +32,90 @@
 	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
 	<string>6</string>
+	<!-- Register as a destination for "Open in..." / the share sheet.
+	     Without CFBundleDocumentTypes iOS never lists the app for a RAW file,
+	     even though the app's own file importer can already decode it. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Camera RAW Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.camera-raw-image</string>
+				<string>com.adobe.raw-image</string>
+				<string>public.image</string>
+				<string>com.hanze.spektralab.camera-raw</string>
+				<!-- Catch-all: a downloaded RAW whose extension the system
+				     does not know is typed as public.data. Without this the
+				     app would silently be missing from the share sheet. -->
+				<string>public.data</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Vendor RAW extensions are not all registered by iOS. Declaring them
+	     as an imported type makes .arw / .nef / .cr3 / .raf / ... resolvable
+	     to a concrete UTI instead of an anonymous dyn.* type. -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.hanze.spektralab.camera-raw</string>
+			<key>UTTypeDescription</key>
+			<string>Camera RAW image</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.image</string>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>dng</string>
+					<string>arw</string>
+					<string>sr2</string>
+					<string>srf</string>
+					<string>cr2</string>
+					<string>cr3</string>
+					<string>crw</string>
+					<string>nef</string>
+					<string>nrw</string>
+					<string>raf</string>
+					<string>orf</string>
+					<string>rw2</string>
+					<string>pef</string>
+					<string>ptx</string>
+					<string>3fr</string>
+					<string>fff</string>
+					<string>iiq</string>
+					<string>k25</string>
+					<string>kdc</string>
+					<string>dcr</string>
+					<string>mrw</string>
+					<string>raw</string>
+					<string>rwz</string>
+					<string>srw</string>
+					<string>x3f</string>
+					<string>mos</string>
+					<string>erf</string>
+					<string>mef</string>
+					<string>mdc</string>
+					<string>bay</string>
+					<string>cap</string>
+					<string>eip</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+	<!-- false: iOS copies the shared file into the app's Inbox, so the
+	     existing importFiles(from:) can read it without a security scope. -->
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>MinimumOSVersion</key>
