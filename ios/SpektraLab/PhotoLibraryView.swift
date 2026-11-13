@@ -820,7 +820,9 @@ struct PhotoLibraryView: View {
                     Label("从相册添加照片", systemImage: "photo.on.rectangle.angled")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(height: compact ? 44 : 50)
+                        // PhotosPicker's label is @Sendable: no @MainActor
+                        // property (compact) may be read inside it.
+                        .frame(height: 44)
                         .foregroundStyle(.white)
                         .labGlassTint(Color.labRed.opacity(0.16), in: Capsule())
                 }
@@ -913,7 +915,7 @@ struct ImportSourcesSheet: View {
                         PhotosPicker(selection: $pickerItems,
                                      maxSelectionCount: 100,
                                      matching: .images) {
-                            importRow(title: "从相册导入",
+                            ImportRowView(title: "从相册导入",
                                       detail: "系统相册 · 支持多选与 HEIC / JPEG",
                                       symbol: "photo.on.rectangle.angled",
                                       primary: true)
@@ -925,7 +927,7 @@ struct ImportSourcesSheet: View {
                             route = .files
                             dismiss()
                         } label: {
-                            importRow(title: "选择文件",
+                            ImportRowView(title: "选择文件",
                                       detail: "从「文件」App 选一张或多张 RAW / JPEG",
                                       symbol: "doc.badge.plus",
                                       primary: false)
@@ -936,7 +938,7 @@ struct ImportSourcesSheet: View {
                             route = .folder
                             dismiss()
                         } label: {
-                            importRow(title: "选择整个文件夹",
+                            ImportRowView(title: "选择整个文件夹",
                                       detail: "自动批量导入文件夹内所有照片（最多 200 张）",
                                       symbol: "folder.badge.plus",
                                       primary: false)
@@ -963,8 +965,17 @@ struct ImportSourcesSheet: View {
         }
     }
 
-    private func importRow(title: String, detail: String,
-                           symbol: String, primary: Bool) -> some View {
+}
+
+/// A plain value view. Constructing it inside a @Sendable PhotosPicker label
+/// is safe; calling a @MainActor-isolated instance method there is not.
+private struct ImportRowView: View {
+    let title: String
+    let detail: String
+    let symbol: String
+    let primary: Bool
+
+    var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
                 .font(.system(size: 19, weight: .semibold))
