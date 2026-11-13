@@ -322,17 +322,34 @@ final class ViewModel: ObservableObject {
             : "已导入 \(imported) 张，\(failed) 张无法读取"
     }
 
-    /// Import one or more files, including the RAW containers Photos may only
-    /// expose as a rendered preview.
+    /// Import files, "Open in..." URLs, or a whole picked folder.
+    ///
+    /// A folder chosen in the document picker grants one security-scoped
+    /// scope; child URLs derived from it stay readable only while that scope
+    /// is held. So expansion and every read happen inside a single access
+    /// window, and the batch is capped to keep a 3 GB phone from being
+    /// buried by a 2,000-file camera roll folder.
     func importFiles(from urls: [URL]) async {
         guard !urls.isEmpty else { return }
-        libraryBusy = "正在导入 0/\(urls.count)"
+
+        let grants = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        defer {
+            for (url, granted) in grants where granted {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let expanded = expandImageURLs(urls)
+        guard !expanded.isEmpty else {
+            libraryMessage = "没有找到可导入的照片"
+            return
+        }
+
+        libraryBusy = "正在导入 0/\(expanded.count)"
         var imported = 0
         var failed = 0
-        for (index, url) in urls.enumerated() {
-            libraryBusy = "正在导入 \(index + 1)/\(urls.count)"
-            let accessed = url.startAccessingSecurityScopedResource()
-            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        for (index, url) in expanded.enumerated() {
+            libraryBusy = "正在导入 \(index + 1)/\(expanded.count)"
             do {
                 let data = try Data(contentsOf: url, options: [.mappedIfSafe])
                 guard !data.isEmpty else { throw DecodeError.unreadable("文件为空") }
@@ -350,6 +367,46 @@ final class ViewModel: ObservableObject {
         libraryMessage = failed == 0
             ? "已导入 \(imported) 张照片"
             : "已导入 \(imported) 张，\(failed) 张无法读取"
+    }
+
+    /// Turn picked folders into a bounded, name-sorted list of image files.
+    /// Kept as an instance method so it inherits the model's main-actor
+    /// isolation; it runs inside the caller's security-scoped window.
+    private func expandImageURLs(_ urls: [URL]) -> [URL] {
+        // The RAW extensions declared in Info.plist, plus ordinary images.
+        let allowed: Set<String> = [
+            "arw", "srf", "sr2", "cr2", "cr3", "crw", "nef", "nrw", "dng",
+            "raf", "orf", "rw2", "rwl", "pef", "ptx", "raw", "rwz", "3fr",
+            "fff", "iiq", "k25", "kdc", "dcr", "mos", "mef", "erf", "mrw",
+            "x3f", "srw", "bay", "cap",
+            "jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp"
+        ]
+        let limit = 200
+        var files: [URL] = []
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path,
+                                                 isDirectory: &isDirectory) else { continue }
+            if !isDirectory.boolValue {
+                files.append(url)
+            } else if let enumerator = FileManager.default.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
+                while let child = enumerator.nextObject() as? URL {
+                    let values = try? child.resourceValues(forKeys: [.isRegularFileKey])
+                    guard values?.isRegularFile == true,
+                          allowed.contains(child.pathExtension.lowercased()) else { continue }
+                    files.append(child)
+                    if files.count >= limit { break }
+                }
+            }
+            if files.count >= limit { break }
+        }
+        return files.sorted {
+            $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent)
+                == .orderedAscending
+        }
     }
 
     /// Single-file compatibility entry point for the DEBUG probe.
@@ -1054,15 +1111,16 @@ final class ViewModel: ObservableObject {
     /// Export the print to the photo library.
     ///
     /// Decode the source at its original resolution and render in strips.
-    func exportToPhotos() async {
+    func exportToPhotos(quality: ExportQuality = .high) async {
         guard let engine, let originalData else {
             statusText = "还没有可导出的照片"
             return
         }
         state = .importing
         let cap = ImageDecoder.exportLongEdge()
-        statusText = cap.map { "正在导出（最长边 \($0) px）…" }
-            ?? "正在导出高质量 JPEG…"
+        let label = "正在导出 \(quality.rawValue) JPEG"
+        statusText = cap.map { "\(label)（最长边 \($0) px）…" }
+            ?? "\(label)…"
 
         do {
             let data = originalData
@@ -1105,7 +1163,7 @@ final class ViewModel: ObservableObject {
                 try engine.solve(target: "both")
                 let bitmap = try engine.renderBitmap(tier: "full", reprint: false)
                 let url = try autoreleasepool {
-                    try Self.writeJPEG(from: bitmap.cgImage)
+                    try Self.writeJPEG(from: bitmap.cgImage, quality: quality.compression)
                 }
                 return ExportOutcome(url: url, width: bitmap.width, height: bitmap.height)
             }
@@ -1133,11 +1191,12 @@ final class ViewModel: ObservableObject {
     /// the Metal texture into a CPU array and converted every pixel to RGBA8;
     /// that array, plus the 8-bit Data buffer, was roughly 500 MB at 24 MP and
     /// was the cause of the export-time jetsam kills.
-    private nonisolated static func writeJPEG(from cgImage: CGImage) throws -> URL {
+    private nonisolated static func writeJPEG(from cgImage: CGImage,
+                                                quality: Double) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("SpektraLab-\(UUID().uuidString).jpg")
         let properties: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 0.92
+            kCGImageDestinationLossyCompressionQuality: quality
         ]
 
         func encode(_ image: CGImage) -> Bool {
@@ -1224,6 +1283,40 @@ enum PhotoLibrary {
                 .addResource(with: .photo, fileURL: url, options: nil)
         }
     }
+}
+
+/// JPEG 导出质量档位，由用户在导出面板里选择并持久化。
+///
+/// 只改变压缩率，不改变渲染分辨率，所以不会影响上一次修复过的内存峰值：
+/// 分辨率上限仍由 `ImageDecoder.exportLongEdge()` 按物理内存决定。
+enum ExportQuality: String, CaseIterable, Identifiable, Sendable {
+    case best = "最佳"
+    case high = "高质量"
+    case standard = "标准"
+    case compact = "省空间"
+
+    var id: String { rawValue }
+
+    /// ImageIO 的 kCGImageDestinationLossyCompressionQuality，0...1。
+    var compression: Double {
+        switch self {
+        case .best: 0.96
+        case .high: 0.88
+        case .standard: 0.75
+        case .compact: 0.58
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .best: "细节最完整，文件也最大 · 适合存档与打印"
+        case .high: "画质与体积平衡 · 日常推荐"
+        case .standard: "明显更小的文件 · 适合备份"
+        case .compact: "文件最小 · 适合快速分享"
+        }
+    }
+
+    static let preferred: ExportQuality = .high
 }
 
 enum ExportError: Error, CustomStringConvertible {

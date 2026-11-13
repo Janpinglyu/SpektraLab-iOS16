@@ -161,8 +161,25 @@ struct LabBackdrop: View {
     }
 }
 
+/// Narrow-phone layout flag, injected once at the root with the *real*
+/// available width. iPhone SE (2/3) is 375pt wide, SE1 320pt, the mini
+/// models 375pt; all of them need tighter chrome than a 390–430pt phone.
+/// Using an environment value avoids touching `UIScreen.main` from a
+/// non-isolated context under Swift 6 strict concurrency.
+private struct LabCompactKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var labCompact: Bool {
+        get { self[LabCompactKey.self] }
+        set { self[LabCompactKey.self] = newValue }
+    }
+}
+
 struct EditorView: View {
     @EnvironmentObject private var model: ViewModel
+    @Environment(\.labCompact) private var compact
     @State private var showingExport = false
     @State private var showingDiagnostics = false
     @State private var showingFilmEffects = false
@@ -236,18 +253,9 @@ struct EditorView: View {
         .animation(.spring(response: 0.24, dampingFraction: 0.82), value: immersive)
         .statusBarHidden(immersive)
         .preferredColorScheme(.dark)
-        .alert("导出照片", isPresented: $showingExport) {
-            Button("保存到相册") {
-                _ = Task<Void, Never> { @MainActor in
-                    await model.exportToPhotos()
-                }
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(ImageDecoder.exportLongEdge().map {
-                "以最长边 \($0) px 重新渲染为 JPEG 并保存到相册（按本机内存自动限制，避免导出时因内存不足被系统终止）。"
-            } ?? "以原始分辨率渲染为 JPEG 并保存到相册。")
-        }
+        // The export panel now carries the JPEG quality picker, so it is a
+        // sheet rather than an alert (alerts cannot host a Picker).
+        .sheet(isPresented: $showingExport) { ExportSheet(model: model) }
         .sheet(isPresented: $showingDiagnostics) { diagnosticsSheet }
         .sheet(isPresented: $showingFilmEffects) { FilmEffectsSheet(model: model) }
 #if DEBUG
@@ -306,29 +314,44 @@ struct EditorView: View {
     // MARK: - top bar
 
     private var topBar: some View {
-        ZStack {
+        // A ZStack used to float a fixed 190pt film/paper capsule over the
+        // button row. On a 375pt iPhone SE that capsule overlaps the right
+        // glass cluster. A flexible HStack can never overlap, and the type
+        // scales down instead of clipping on 320pt screens.
+        HStack(spacing: compact ? 5 : 8) {
+            Button {
+                model.closeEditor()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 42, height: 42)
+                    .labGlassInteractive(in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("返回照片墙")
+
             Button {
                 withAnimation(.easeOut(duration: 0.18)) { deck = .film }
             } label: {
                 VStack(spacing: 1) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Text(model.currentFilmName)
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(.system(size: compact ? 13 : 15, weight: .semibold))
                             .foregroundStyle(Color.labCream)
                             .lineLimit(1)
-                            .minimumScaleFactor(0.72)
+                            .minimumScaleFactor(0.62)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 8, weight: .bold))
                             .foregroundStyle(Color.labCream.opacity(0.55))
                     }
                     Text(model.currentPaperName)
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: compact ? 8 : 9, weight: .medium))
                         .foregroundStyle(Color.secondary.opacity(0.78))
                         .lineLimit(1)
-                        .minimumScaleFactor(0.78)
+                        .minimumScaleFactor(0.72)
                 }
-                .padding(.horizontal, 14)
-                .frame(maxWidth: 190)
+                .padding(.horizontal, compact ? 7 : 14)
+                .frame(maxWidth: .infinity)
                 .frame(height: 42)
                 .contentShape(Rectangle())
             }
@@ -336,75 +359,60 @@ struct EditorView: View {
             .accessibilityLabel("当前胶片 \(model.currentFilmName)，相纸 \(model.currentPaperName)")
             .labGlassInteractive(in: Capsule())
 
-            HStack(spacing: 8) {
-                Button {
-                    model.closeEditor()
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 15, weight: .semibold))
-                        .frame(width: 42, height: 42)
-                        .labGlassInteractive(in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("返回照片墙")
-
-                Spacer()
-
-                LabGlassContainer(spacing: 8) {
-                    HStack(spacing: 8) {
-                        Menu {
-                            if model.editingPhotoID != nil {
-                                Button {
-                                    if let id = model.editingPhotoID {
-                                        model.copyRecipe(from: id)
-                                        copyToast = true
-                                        Task { @MainActor in
-                                            try? await Task.sleep(for: .seconds(2))
-                                            copyToast = false
-                                        }
+            LabGlassContainer(spacing: compact ? 5 : 8) {
+                HStack(spacing: compact ? 5 : 8) {
+                    Menu {
+                        if model.editingPhotoID != nil {
+                            Button {
+                                if let id = model.editingPhotoID {
+                                    model.copyRecipe(from: id)
+                                    copyToast = true
+                                    Task { @MainActor in
+                                        try? await Task.sleep(for: .seconds(2))
+                                        copyToast = false
                                     }
-                                } label: {
-                                    Label("复制这张照片的配方", systemImage: "doc.on.doc")
                                 }
-                            }
-                            Button {
-                                model.closeEditor()
                             } label: {
-                                Label("保存并返回照片墙", systemImage: "rectangle.stack")
+                                Label("复制这张照片的配方", systemImage: "doc.on.doc")
                             }
-                            Divider()
-                            Button {
-                                showingDiagnostics = true
-                            } label: {
-                                Label("诊断信息", systemImage: "info.circle")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 15, weight: .semibold))
-                                .frame(width: 42, height: 42)
-                                .labGlassInteractive(in: Circle())
                         }
-                        .buttonStyle(.plain)
-
                         Button {
-                            showingExport = true
+                            model.closeEditor()
                         } label: {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.system(size: 15, weight: .semibold))
-                                .frame(width: 42, height: 42)
-                                .labGlassInteractive(in: Circle())
+                            Label("保存并返回照片墙", systemImage: "rectangle.stack")
                         }
-                        .buttonStyle(.plain)
-                        .disabled(model.renderedTexture == nil)
-                        .opacity(model.renderedTexture == nil ? 0.4 : 1)
+                        Divider()
+                        Button {
+                            showingDiagnostics = true
+                        } label: {
+                            Label("诊断信息", systemImage: "info.circle")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 15, weight: .semibold))
+                            .frame(width: 42, height: 42)
+                            .labGlassInteractive(in: Circle())
                     }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        showingExport = true
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 15, weight: .semibold))
+                            .frame(width: 42, height: 42)
+                            .labGlassInteractive(in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.renderedTexture == nil)
+                    .opacity(model.renderedTexture == nil ? 0.4 : 1)
                 }
             }
         }
         .tint(Color.labRed)
         .foregroundStyle(Color.labCream)
         .padding(.top, 3)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, compact ? 8 : 12)
     }
 
     // MARK: - the picture
@@ -580,13 +588,14 @@ struct EditorView: View {
                     } label: {
                         VStack(spacing: 4) {
                             Text(tab.rawValue)
-                                .font(.system(size: 13, weight: deck == tab ? .semibold : .medium))
+                                .font(.system(size: compact ? 11.5 : 13,
+                                              weight: deck == tab ? .semibold : .medium))
                                 .foregroundStyle(deck == tab ? Color.labCream : Color.secondary.opacity(0.48))
                             Capsule()
                                 .fill(deck == tab ? Color.labCream : Color.clear)
                                 .frame(width: 18, height: 1.5)
                         }
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, compact ? 6 : 10)
                         .padding(.top, 7)
                         .contentShape(Rectangle())
                     }
@@ -606,14 +615,16 @@ struct EditorView: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, compact ? 10 : 14)
             .padding(.bottom, 2)
 
             deckContent
-                .frame(height: deck == .adjust ? 158 : 70)
+                .frame(height: deck == .adjust
+                       ? (compact ? 132 : 158)
+                       : (compact ? 62 : 70))
         }
         .labGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .padding(.horizontal, 10)
+        .padding(.horizontal, compact ? 6 : 10)
         .padding(.bottom, 8)
     }
 
@@ -647,7 +658,7 @@ struct EditorView: View {
 
     private var adjustPanel: some View {
         ScrollView {
-            VStack(spacing: 9) {
+            VStack(spacing: compact ? 6 : 9) {
                 effectControls
                 ForEach(ParamCatalog.all) { control in
                     ParamSlider(control: control,
@@ -656,7 +667,7 @@ struct EditorView: View {
                                     set: { model.parameterChanged(control.key, $0) }))
                 }
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, compact ? 10 : 16)
             .padding(.vertical, 6)
         }
     }
@@ -810,6 +821,86 @@ struct EditorView: View {
             }
         }
         .presentationDetents([.medium])
+    }
+}
+
+/// Export settings panel. An alert cannot host a Picker, so the JPEG quality
+/// choice lives in a compact sheet. The selection is persisted with
+/// @AppStorage and handed to `ViewModel.exportToPhotos(quality:)`.
+struct ExportSheet: View {
+    // Passed explicitly: sheets do not reliably inherit @EnvironmentObject
+    // on every iOS 16 patch release.
+    let model: ViewModel
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("spektralab.exportQuality")
+    private var qualityRaw = ExportQuality.preferred.rawValue
+
+    private var quality: ExportQuality {
+        ExportQuality(rawValue: qualityRaw) ?? .high
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let compact = geo.size.width <= 390
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: compact ? 14 : 20) {
+                        Text("JPEG 质量")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        Picker("JPEG 质量", selection: $qualityRaw) {
+                            ForEach(ExportQuality.allCases) { option in
+                                Text(option.rawValue).tag(option.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Text(quality.detail)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Divider()
+
+                        Label {
+                            Text(ImageDecoder.exportLongEdge().map {
+                                "以最长边 \($0) px 重新渲染（按本机内存自动限制，避免导出时因内存不足被系统终止）。质量档位只影响压缩率，不改变内存占用。"
+                            } ?? "以原始分辨率重新渲染。质量档位只影响压缩率。")
+                        } icon: {
+                            Image(systemName: "memorychip")
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                        Button {
+                            let chosen = quality
+                            dismiss()
+                            Task { @MainActor in
+                                await model.exportToPhotos(quality: chosen)
+                            }
+                        } label: {
+                            Label("保存到相册", systemImage: "square.and.arrow.up")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 46)
+                                .foregroundStyle(.white)
+                                .background(Color.labRed.opacity(0.86), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, compact ? 4 : 10)
+                    }
+                    .padding(compact ? 14 : 20)
+                }
+                .navigationTitle("导出照片")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("取消") { dismiss() }
+                    }
+                }
+            }
+            .presentationDetents([.height(compact ? 320 : 360), .medium])
+        }
     }
 }
 

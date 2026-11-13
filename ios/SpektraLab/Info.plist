@@ -122,6 +122,8 @@
 	<string>16.0</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>SpektraLab 需要保存你冲洗出的照片到相册。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>SpektraLab 只通过系统照片选择器读取你选中的照片，不会访问整个相册。</string>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>

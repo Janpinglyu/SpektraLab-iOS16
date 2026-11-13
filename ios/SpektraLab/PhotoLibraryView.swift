@@ -9,11 +9,32 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 
+/// The three explicit import routes. A file/folder picker cannot be presented
+/// while another sheet is on screen, so the chooser records a route and the
+/// wall presents it after the chooser has fully disappeared.
+enum ImportRoute: String, Identifiable {
+    case photos
+    case files
+    case folder
+    var id: String { rawValue }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: ViewModel
     @State private var showingCrashNotice = false
 
     var body: some View {
+        // Inject the real available width once. Every screen reads
+        // `labCompact`, so an iPhone SE (375pt / 320pt) gets tighter chrome
+        // without hard-coding a device model or touching UIScreen.
+        GeometryReader { geo in
+            rootContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .environment(\.labCompact, geo.size.width <= 390)
+        }
+    }
+
+    private var rootContent: some View {
         Group {
             if model.editingPhotoID != nil {
                 EditorView()
@@ -73,15 +94,28 @@ struct ContentView: View {
 
 struct PhotoLibraryView: View {
     @EnvironmentObject private var model: ViewModel
+    @Environment(\.labCompact) private var compact
     @State private var pickerItems: [PhotosPickerItem] = []
-    @State private var showingFileImporter = false
+    // One document picker, switched between file and folder mode. Two
+    // sibling .fileImporter presentations fight on iOS 16.
+    @State private var showingDocumentPicker = false
+    @State private var documentPickerIsFolder = false
+    @State private var showingImportSheet = false
+    @State private var pendingImportRoute: ImportRoute? = nil
     @State private var selecting = false
     @State private var selected: Set<UUID> = []
     @State private var deleteIDs: Set<UUID> = []
     @State private var showingDelete = false
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 4, alignment: .top),
-                                count: 3)
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: compact ? 3 : 4, alignment: .top),
+              count: 3)
+    }
+
+    private func presentDocuments(folder: Bool) {
+        documentPickerIsFolder = folder
+        showingDocumentPicker = true
+    }
 
     private var selectablePhotoIDs: Set<UUID> {
         var ids = Set(model.library.map(\.id))
@@ -108,9 +142,11 @@ struct PhotoLibraryView: View {
                         wall
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-                .padding(.bottom, selecting ? 148 : (model.library.isEmpty ? 44 : 124))
+                .padding(.horizontal, compact ? 10 : 14)
+                .padding(.top, compact ? 6 : 10)
+                .padding(.bottom, selecting ? (compact ? 138 : 148)
+                         : (model.library.isEmpty ? (compact ? 32 : 44)
+                            : (compact ? 114 : 124)))
             }
             .scrollIndicators(.hidden)
 
@@ -149,11 +185,28 @@ struct PhotoLibraryView: View {
                 selected.remove(source)
             }
         }
-        .fileImporter(isPresented: $showingFileImporter,
-                      allowedContentTypes: [.image, .rawImage],
-                      allowsMultipleSelection: true) { result in
+        .fileImporter(isPresented: $showingDocumentPicker,
+                      allowedContentTypes: documentPickerIsFolder
+                          ? [.folder] : [.image, .rawImage],
+                      allowsMultipleSelection: !documentPickerIsFolder) { result in
             guard case .success(let urls) = result else { return }
+            // ViewModel.importFiles expands a picked folder into its image
+            // files while the folder's security scope is still held.
             Task { @MainActor in await model.importFiles(from: urls) }
+        }
+        .sheet(isPresented: $showingImportSheet) {
+            ImportSourcesSheet(pickerItems: $pickerItems, route: $pendingImportRoute)
+        }
+        .onChange(of: showingImportSheet) { presented in
+            guard !presented, let route = pendingImportRoute else { return }
+            pendingImportRoute = nil
+            Task { @MainActor in
+                // Let the chooser finish dismissing before presenting the
+                // document picker; two simultaneous presentations fight.
+                try? await Task.sleep(for: .milliseconds(220))
+                guard route != .photos else { return }  // PhotosPicker handles it
+                presentDocuments(folder: route == .folder)
+            }
         }
         .confirmationDialog("删除这些照片？",
                             isPresented: $showingDelete,
@@ -178,26 +231,27 @@ struct PhotoLibraryView: View {
     // MARK: - header
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: compact ? 8 : 12) {
             VStack(alignment: .leading, spacing: 5) {
                 Text("SPEKTRA LAB")
                     .font(.system(size: 9, weight: .bold))
                     .tracking(1.8)
                     .foregroundStyle(Color.labRed.opacity(0.82))
                 Text(selecting ? "选择照片" : "照片库")
-                    .font(.system(size: 34, weight: .bold))
+                    .font(.system(size: compact ? 27 : 34, weight: .bold))
                     .tracking(-0.6)
                     .foregroundStyle(Color.labCream)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 Text(subtitle)
                     .font(.footnote.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(Color.labCream.opacity(0.48))
                     .lineLimit(1)
             }
-            Spacer(minLength: 8)
-            LabGlassContainer(spacing: 8) {
-                HStack(spacing: 8) {
+            Spacer(minLength: compact ? 4 : 8)
+            LabGlassContainer(spacing: compact ? 5 : 8) {
+                HStack(spacing: compact ? 5 : 8) {
                     if !model.library.isEmpty {
                         Button {
                             withAnimation(.spring(response: 0.20, dampingFraction: 0.82)) {
@@ -216,22 +270,31 @@ struct PhotoLibraryView: View {
                     }
 
                     if !selecting {
-                        PhotosPicker(selection: $pickerItems,
-                                     maxSelectionCount: 100,
-                                     matching: .images) {
+                        // One visible button opens the import chooser --
+                        // previously the folder route was hidden behind a
+                        // long press, which nobody could discover.
+                        Button {
+                            showingImportSheet = true
+                        } label: {
                             Image(systemName: "plus")
                                 .font(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(Color.labCream)
                                 .frame(width: 44, height: 44)
                                 .labGlassInteractive(in: Circle())
                         }
+                        .buttonStyle(.plain)
                         .tint(Color.labCream)
-                        .accessibilityLabel("导入照片")
+                        .accessibilityLabel("选择导入方式")
                         .contextMenu {
                             Button {
-                                showingFileImporter = true
+                                presentDocuments(folder: false)
                             } label: {
-                                Label("从文件导入 RAW / JPEG", systemImage: "folder")
+                                Label("快速选择文件", systemImage: "doc.badge.plus")
+                            }
+                            Button {
+                                presentDocuments(folder: true)
+                            } label: {
+                                Label("快速选择文件夹", systemImage: "folder")
                             }
                         }
                     }
@@ -241,6 +304,7 @@ struct PhotoLibraryView: View {
         .padding(.top, 2)
         .onChange(of: pickerItems) { items in
             guard !items.isEmpty else { return }
+            showingImportSheet = false
             Task { @MainActor in
                 await model.importPickedItems(items)
                 pickerItems = []
@@ -299,24 +363,29 @@ struct PhotoLibraryView: View {
     /// The wall's editing dock. It keeps the measured film rolls visible at
     /// all times, so the library reads as a darkroom rather than a gallery.
     private var filmWorkbench: some View {
-        HStack(spacing: 9) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 4) {
-                    Image(systemName: "film")
-                        .font(.system(size: 10, weight: .semibold))
-                    Text("胶片实验室")
-                        .font(.system(size: 11.5, weight: .semibold))
+        HStack(spacing: compact ? 6 : 9) {
+            // On a 375pt SE the 80pt caption plus divider left too little
+            // room for the film strip, so the compact dock shows only the
+            // scrollable rolls and the edit action.
+            if !compact {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "film")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("胶片实验室")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .foregroundStyle(Color.labCream.opacity(0.88))
+                    Text("点按直接试色")
+                        .font(.system(size: 8.5, weight: .medium))
+                        .foregroundStyle(Color.labCream.opacity(0.38))
                 }
-                .foregroundStyle(Color.labCream.opacity(0.88))
-                Text("点按直接试色")
-                    .font(.system(size: 8.5, weight: .medium))
-                    .foregroundStyle(Color.labCream.opacity(0.38))
-            }
-            .frame(width: 80, alignment: .leading)
+                .frame(width: 80, alignment: .leading)
 
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 1, height: 34)
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 1, height: 34)
+            }
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -387,15 +456,15 @@ struct PhotoLibraryView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("编辑最新照片")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.horizontal, compact ? 7 : 10)
+        .padding(.vertical, compact ? 6 : 9)
         .labGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.30), radius: 24, y: 10)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, compact ? 6 : 10)
         .padding(.bottom, 6)
     }
 
@@ -718,67 +787,79 @@ struct PhotoLibraryView: View {
             ZStack {
                 Circle()
                     .fill(Color.labRed.opacity(0.12))
-                    .frame(width: 164, height: 164)
+                    .frame(width: compact ? 120 : 164, height: compact ? 120 : 164)
                     .blur(radius: 30)
                 Circle()
                     .fill(Color.white.opacity(0.035))
-                    .frame(width: 108, height: 108)
+                    .frame(width: compact ? 84 : 108, height: compact ? 84 : 108)
                 Circle()
                     .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-                    .frame(width: 108, height: 108)
+                    .frame(width: compact ? 84 : 108, height: compact ? 84 : 108)
                 Image(systemName: "photo.stack")
-                    .font(.system(size: 38, weight: .light))
+                    .font(.system(size: compact ? 30 : 38, weight: .light))
                     .foregroundStyle(Color.labCream.opacity(0.86))
             }
-            .frame(height: 172)
+            .frame(height: compact ? 132 : 172)
 
             VStack(spacing: 8) {
                 Text("把一组照片带进来")
-                    .font(.title2.weight(.semibold))
+                    .font((compact ? Font.title3 : Font.title2).weight(.semibold))
                     .tracking(-0.3)
                     .foregroundStyle(Color.labCream)
-                Text("点开一张开始调色，返回后就是照片墙。\n长按照片复制配方，多选后一键粘贴。")
+                Text("相册、文件或整个文件夹都能导入。\n点开一张开始调色，返回后就是照片墙。")
                     .font(.footnote)
                     .foregroundStyle(Color.labCream.opacity(0.44))
                     .multilineTextAlignment(.center)
                     .lineSpacing(3)
             }
 
-            VStack(spacing: 10) {
+            VStack(spacing: compact ? 8 : 10) {
                 PhotosPicker(selection: $pickerItems,
                              maxSelectionCount: 100,
                              matching: .images) {
                     Label("从相册添加照片", systemImage: "photo.on.rectangle.angled")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(height: 50)
+                        .frame(height: compact ? 44 : 50)
                         .foregroundStyle(.white)
                         .labGlassTint(Color.labRed.opacity(0.16), in: Capsule())
                 }
                 .tint(Color.labCream)
 
                 Button {
-                    showingFileImporter = true
+                    presentDocuments(folder: false)
                 } label: {
-                    Label("从文件导入 RAW / JPEG", systemImage: "folder.badge.plus")
+                    Label("选择文件（可多选）", systemImage: "doc.badge.plus")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(Color.labCream.opacity(0.82))
                         .frame(maxWidth: .infinity)
-                        .frame(height: 46)
+                        .frame(height: compact ? 40 : 46)
+                        .labGlassInteractive(in: Capsule())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    presentDocuments(folder: true)
+                } label: {
+                    Label("选择整个文件夹（批量导入）", systemImage: "folder.badge.plus")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color.labCream.opacity(0.82))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: compact ? 40 : 46)
                         .labGlassInteractive(in: Capsule())
                 }
                 .buttonStyle(.plain)
             }
-            .frame(maxWidth: 310)
-            .padding(.top, 28)
+            .frame(maxWidth: compact ? CGFloat.infinity : 310)
+            .padding(.top, compact ? 16 : 28)
 
-            Text("支持 Sony ARW · DNG · JPEG · HEIC")
+            Text("相册 / 文件 / 文件夹 · 支持 Sony ARW · DNG · JPEG · HEIC")
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(Color.labCream.opacity(0.28))
-                .padding(.top, 14)
+                .padding(.top, compact ? 10 : 14)
         }
-        .padding(.top, 20)
-        .frame(minHeight: 500)
+        .padding(.top, compact ? 8 : 20)
+        .frame(minHeight: compact ? 430 : 500)
         .frame(maxWidth: .infinity)
     }
 
@@ -811,5 +892,107 @@ struct PhotoLibraryView: View {
             .labGlass(in: Capsule())
             .shadow(color: .black.opacity(0.32), radius: 20, y: 8)
         .allowsHitTesting(false)
+    }
+}
+
+/// An explicit three-way import chooser. The album row is a real
+/// PhotosPicker (that is the iOS 16 presentation mechanism); the two
+/// document-picker routes are recorded and presented by the wall after this
+/// sheet disappears, so two sheets never fight over presentation.
+struct ImportSourcesSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var pickerItems: [PhotosPickerItem]
+    @Binding var route: ImportRoute?
+
+    var body: some View {
+        GeometryReader { geo in
+            let compact = geo.size.width <= 390
+            NavigationStack {
+                ScrollView {
+                    VStack(spacing: compact ? 10 : 14) {
+                        PhotosPicker(selection: $pickerItems,
+                                     maxSelectionCount: 100,
+                                     matching: .images) {
+                            importRow(title: "从相册导入",
+                                      detail: "系统相册 · 支持多选与 HEIC / JPEG",
+                                      symbol: "photo.on.rectangle.angled",
+                                      primary: true)
+                        }
+                        .buttonStyle(.plain)
+                        .tint(Color.labCream)
+
+                        Button {
+                            route = .files
+                            dismiss()
+                        } label: {
+                            importRow(title: "选择文件",
+                                      detail: "从「文件」App 选一张或多张 RAW / JPEG",
+                                      symbol: "doc.badge.plus",
+                                      primary: false)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            route = .folder
+                            dismiss()
+                        } label: {
+                            importRow(title: "选择整个文件夹",
+                                      detail: "自动批量导入文件夹内所有照片（最多 200 张）",
+                                      symbol: "folder.badge.plus",
+                                      primary: false)
+                        }
+                        .buttonStyle(.plain)
+
+                        Text("相册由系统选择器提供，无需额外授权；文件夹导入仅在选择期间获得读取权限，一次最多 200 张。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, compact ? 2 : 6)
+                    }
+                    .padding(compact ? 14 : 20)
+                }
+                .navigationTitle("导入照片")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("取消") { dismiss() }
+                    }
+                }
+            }
+            .presentationDetents([.height(compact ? 330 : 370), .medium])
+        }
+    }
+
+    private func importRow(title: String, detail: String,
+                           symbol: String, primary: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(primary ? Color.white : Color.labCream.opacity(0.88))
+                .frame(width: 40, height: 40)
+                .background(primary ? Color.labRed.opacity(0.72) : Color.white.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.labCream)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.045),
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
     }
 }
