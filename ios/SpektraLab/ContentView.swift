@@ -244,7 +244,9 @@ struct EditorView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("以手机安全尺寸重新渲染为 JPEG 并保存到相册。")
+            Text(ImageDecoder.exportLongEdge().map {
+                "以最长边 \($0) px 重新渲染为 JPEG 并保存到相册（按本机内存自动限制，避免导出时因内存不足被系统终止）。"
+            } ?? "以原始分辨率渲染为 JPEG 并保存到相册。")
         }
         .sheet(isPresented: $showingDiagnostics) { diagnosticsSheet }
         .sheet(isPresented: $showingFilmEffects) { FilmEffectsSheet(model: model) }

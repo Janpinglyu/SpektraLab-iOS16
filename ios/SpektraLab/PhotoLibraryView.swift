@@ -11,6 +11,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: ViewModel
+    @State private var showingCrashNotice = false
 
     var body: some View {
         Group {
@@ -24,6 +25,17 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.22), value: model.editingPhotoID)
         .preferredColorScheme(.dark)
+        // A jetsam kill has no crash report the app can catch. Show the
+        // breadcrumb left before the stage that died, on the front door, so
+        // the next launch says where it stopped instead of reopening silently.
+        .alert("上次异常退出", isPresented: $showingCrashNotice) {
+            Button("好", role: .cancel) { model.clearCrashNotice() }
+        } message: {
+            Text(model.crashNotice ?? "")
+        }
+        .onAppear {
+            if model.crashNotice != nil { showingCrashNotice = true }
+        }
 #if DEBUG
         .task {
             let environment = ProcessInfo.processInfo.environment

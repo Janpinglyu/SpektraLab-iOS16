@@ -39,6 +39,42 @@ private func spektraFatalSignal(_ received: Int32) {
 enum CrashLog {
 
     private static let key = "lastCrash"
+    private static let stageKey = "lastExportStage"
+
+    /// A breadcrumb written *before* each export stage starts.
+    ///
+    /// Jetsam kills the process with SIGKILL, which no signal handler can
+    /// observe. Without this note, an out-of-memory export looks identical to
+    /// a clean exit: the app just disappears. The last stage left on disk is
+    /// the stage that was running when the system pulled the plug.
+    static func mark(_ stage: String) {
+        UserDefaults.standard.set(stage, forKey: stageKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func clearStage() {
+        UserDefaults.standard.removeObject(forKey: stageKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func takeStage() -> String? {
+        let value = UserDefaults.standard.string(forKey: stageKey)
+        UserDefaults.standard.removeObject(forKey: stageKey)
+        return value
+    }
+
+    /// One notice for the previous run, consumed at the next launch.
+    static func consumeNotice() -> String? {
+        if let crash = take() {
+            _ = takeStage()
+            return "上次异常退出：\(crash)"
+        }
+        if let stage = takeStage() {
+            return "上次在「\(stage)」阶段被系统终止。没有捕获到异常信号，"
+                + "通常是内存不足（jetsam）；新版已自动限制导出分辨率。"
+        }
+        return nil
+    }
 
     /// Install the handlers. Call once, as early as possible.
     static func install() {

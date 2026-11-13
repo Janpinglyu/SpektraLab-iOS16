@@ -199,8 +199,25 @@ enum ImageDecoder {
     /// for a result nobody sees. The export path decodes at full size.
     static let previewLongEdge = 2048
 
-    /// Export at the source resolution; only the interactive preview shrinks.
-    static let exportLongEdge: Int? = nil
+    /// Export long edge, capped to what a real phone can survive.
+    ///
+    /// This used to be `nil` (source resolution). At 26 MP the decoder briefly
+    /// holds two float32 frames (RGBAf + RGB, roughly 730 MB), the engine holds
+    /// a GPU copy, and the `full` render adds 16-bit RGBA (another 208 MB).
+    /// That chain passes in the iOS 27 simulator, which has a Mac's memory,
+    /// but jetsam kills a real iPhone. SIGKILL cannot run a crash handler, so
+    /// the only visible symptom was "the app closes when I export".
+    ///
+    /// Scale by physical RAM instead of OS version: side-loaded / TrollStore
+    /// devices are often older 2-3 GB phones with the tightest jetsam budget.
+    /// Scaling happens inside the decoder (LibRaw / CIImage), so every later
+    /// buffer shrinks with it.
+    static func exportLongEdge() -> Int? {
+        let ram = ProcessInfo.processInfo.physicalMemory
+        if ram < 3_000_000_000 { return 2560 }
+        if ram < 4_000_000_000 { return 3072 }
+        return 4096
+    }
 
     /// The exact float working space used by the Mac 1.3.5 decoder.
     private static let linearProPhoto: CGColorSpace? = {
@@ -546,19 +563,28 @@ enum ImageDecoder {
         }
         let placed = image.transformed(by: CGAffineTransform(translationX: -extent.origin.x,
                                                               y: -extent.origin.y))
-        var rgba = [Float](repeating: 0, count: width * height * 4)
-        rgba.withUnsafeMutableBytes { bytes in
-            guard let base = bytes.baseAddress else { return }
-            context.render(placed, toBitmap: base, rowBytes: width * 16,
-                           bounds: CGRect(x: 0, y: 0, width: width, height: height),
-                           format: .RGBAf, colorSpace: colorSpace)
-        }
-        var rgb = [Float](repeating: 0, count: width * height * 3)
-        for pixel in 0..<(width * height) {
-            rgb[pixel * 3] = rgba[pixel * 4]
-            rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1]
-            rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2]
-        }
+        // Core Image only renders RGBAf, but the engine wants tightly packed
+        // RGB. Scope the RGBAf frame to this closure so ARC releases it the
+        // moment the conversion is done: two full-size float32 frames alive at
+        // once was the single largest peak in the export path (416 MB + 312 MB
+        // at 26 MP). Swift does not promise an early release for a function-
+        // level local, and this one must not outlive the loop.
+        let rgb: [Float] = {
+            var rgba = [Float](repeating: 0, count: width * height * 4)
+            rgba.withUnsafeMutableBytes { bytes in
+                guard let base = bytes.baseAddress else { return }
+                context.render(placed, toBitmap: base, rowBytes: width * 16,
+                               bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                               format: .RGBAf, colorSpace: colorSpace)
+            }
+            var out = [Float](repeating: 0, count: width * height * 3)
+            for pixel in 0..<(width * height) {
+                out[pixel * 3] = rgba[pixel * 4]
+                out[pixel * 3 + 1] = rgba[pixel * 4 + 1]
+                out[pixel * 3 + 2] = rgba[pixel * 4 + 2]
+            }
+            return out
+        }()
         return DecodedFrame(pixels: FloatRGBPixels(rgb), width: width, height: height)
     }
 

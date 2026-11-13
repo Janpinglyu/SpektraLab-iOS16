@@ -17,6 +17,8 @@ import Metal
 import Photos
 import PhotosUI
 import UIKit
+import CoreGraphics
+import ImageIO
 import UniformTypeIdentifiers
 import ImageIO
 
@@ -42,6 +44,12 @@ final class ViewModel: ObservableObject {
 
     @Published private(set) var state: AppState = .empty
     @Published private(set) var statusText = ""
+    /// A note left by the previous run when it was killed, shown once as an
+    /// alert. Kept separate from `state` so it cannot be overwritten by the
+    /// normal startup / photo-import status text.
+    @Published private(set) var crashNotice: String?
+
+    func clearCrashNotice() { crashNotice = nil }
     @Published private(set) var renderedTexture: MTLTexture?
 
     /// What identifies the current render.
@@ -208,6 +216,10 @@ final class ViewModel: ObservableObject {
     // MARK: - life cycle
 
     init() {
+        // Read before anything else touches state: this is the only chance to
+        // tell the user why the app disappeared during the last export.
+        crashNotice = CrashLog.consumeNotice()
+
         guard let device = MTLCreateSystemDefaultDevice() else {
             state = .failed("这台设备没有可用的 Metal 设备")
             return
@@ -265,13 +277,9 @@ final class ViewModel: ObservableObject {
         }
     }
 
-    /// Puts the previous run's crash on screen, so it does not take another
-    /// cycle of "it just closes" to find out what happened.
-    private func reportPreviousCrash() {
-        guard let crash = CrashLog.take() else { return }
-        state = .failed("上次异常退出：\(crash)")
-        statusText = "上次异常退出 · \(crash)"
-    }
+    /// The previous run's notice is read in `init()` and shown by ContentView
+    /// as a one-shot alert. It deliberately does not write `state`: startup
+    /// and photo import both overwrite that, and the message would vanish.
 
     // MARK: - importing
 
@@ -1052,27 +1060,39 @@ final class ViewModel: ObservableObject {
             return
         }
         state = .importing
-        statusText = "正在导出高质量 JPEG…"
+        let cap = ImageDecoder.exportLongEdge()
+        statusText = cap.map { "正在导出（最长边 \($0) px）…" }
+            ?? "正在导出高质量 JPEG…"
 
         do {
             let data = originalData
             let hint = originalTypeHint
             let cropAspect = filmBorderEnabled ? filmCropAspect : nil
+            CrashLog.mark("1/4 解码 RAW")
+
             // Decoding a RAW container is CPU-heavy. Do it off the main actor
-            // so the export sheet keeps moving and the UI never freezes.
+            // so the export sheet keeps moving, and drain the autorelease pool
+            // explicitly: a detached Task has no run loop, so Core Image /
+            // LibRaw autoreleased frames would otherwise stay alive until the
+            // main run loop next drains — i.e. right through the memory peak.
             let full = try await Task.detached(priority: .userInitiated) {
-                try ImageDecoder.decode(data: data,
-                                        maxLongEdge: ImageDecoder.exportLongEdge,
-                                        typeHint: hint,
-                                        targetAspect: cropAspect)
+                try autoreleasepool {
+                    try ImageDecoder.decode(data: data,
+                                            maxLongEdge: ImageDecoder.exportLongEdge(),
+                                            typeHint: hint,
+                                            targetAspect: cropAspect)
+                }
             }.value
 
             let exportDelta = currentOpenDelta()
+            CrashLog.mark("2/4 引擎渲染与 JPEG 编码")
 
-            // Open, solve and render are one unit on the engine's serial
-            // queue. `full` stays alive only until `open` copies it; the
-            // exported image then owns the engine's 16-bit rows directly.
-            let bitmap = try await engine.perform {
+            // Open, solve, render AND encode are one unit on the engine's
+            // serial queue. The CGImage's data provider owns spk_result's
+            // 16-bit rows; previously it escaped to a detached Task, which
+            // kept the whole frame alive through JPEG compression and called
+            // spk_result_free on an arbitrary thread. Only a file URL leaves.
+            let outcome = try await engine.perform {
                 try full.pixels.withUnsafeBufferPointer { buffer in
                     guard let base = buffer.baseAddress else {
                         throw EngineError.failed(status: -1, message: "解码结果为空")
@@ -1083,23 +1103,26 @@ final class ViewModel: ObservableObject {
                         height: full.height), params: exportDelta)
                 }
                 try engine.solve(target: "both")
-                return try engine.renderBitmap(tier: "full", reprint: false)
+                let bitmap = try engine.renderBitmap(tier: "full", reprint: false)
+                let url = try autoreleasepool {
+                    try Self.writeJPEG(from: bitmap.cgImage)
+                }
+                return ExportOutcome(url: url, width: bitmap.width, height: bitmap.height)
             }
 
-            // Encode on a background task as well: JPEG compression is the
-            // second-long part after a 24 MP render and does not need the main
-            // actor. No UIImage and no full-size JPEG Data are created.
-            let cgImage = bitmap.cgImage
-            let jpegURL = try await Task.detached(priority: .userInitiated) {
-                try Self.writeJPEG(from: cgImage)
-            }.value
-            try await PhotoLibrary.saveJPEG(at: jpegURL)
+            CrashLog.mark("3/4 写入相册")
+            try await PhotoLibrary.saveJPEG(at: outcome.url)
 
-            statusText = String(format: "已导出 %d×%d 到相册", bitmap.width, bitmap.height)
+            CrashLog.clearStage()
+            statusText = String(format: "已导出 %d×%d 到相册",
+                                outcome.width, outcome.height)
             state = .ready
         } catch {
+            CrashLog.clearStage()
             state = .failed(error.localizedDescription)
-            statusText = "导出失败"
+            // The old code replaced this with a bare "导出失败", hiding
+            // whether it was a permission denial, a decode error or encoding.
+            statusText = "导出失败：\(error.localizedDescription)"
         }
     }
 
@@ -1113,22 +1136,59 @@ final class ViewModel: ObservableObject {
     private nonisolated static func writeJPEG(from cgImage: CGImage) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("SpektraLab-\(UUID().uuidString).jpg")
-        guard let destination = CGImageDestinationCreateWithURL(url as CFURL,
-                                                                 UTType.jpeg.identifier as CFString,
-                                                                 1, nil) else {
-            throw ExportError.encodingFailed
-        }
         let properties: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: 0.92
         ]
-        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else {
+
+        func encode(_ image: CGImage) -> Bool {
+            guard let destination = CGImageDestinationCreateWithURL(
+                url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+                return false
+            }
+            CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+            return CGImageDestinationFinalize(destination)
+        }
+
+        // Zero-copy path: ImageIO reads the engine's 16-bit rows through the
+        // CGDataProvider, so no full-size RGBA8 duplicate is allocated.
+        if encode(cgImage) { return url }
+
+        // Pre-iOS-26 SDKs were never exercised against a 16 bpc source (the
+        // upstream export was only verified in the iOS 27 simulator). If
+        // ImageIO refuses it, retry with an 8-bit draw. JPEG is 8-bit anyway,
+        // and the resolution cap keeps this extra frame small.
+        try? FileManager.default.removeItem(at: url)
+        guard let eightBit = Self.eightBitImage(from: cgImage) else {
+            throw ExportError.encodingFailed
+        }
+        guard encode(eightBit) else {
             try? FileManager.default.removeItem(at: url)
             throw ExportError.encodingFailed
         }
         return url
     }
 
+    private nonisolated static func eightBitImage(from image: CGImage) -> CGImage? {
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let context = CGContext(data: nil,
+                                      width: image.width, height: image.height,
+                                      bitsPerComponent: 8, bitsPerPixel: 32,
+                                      bytesPerRow: 0, space: space,
+                                      bitmapInfo: info.rawValue) else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0,
+                                       width: image.width, height: image.height))
+        return context.makeImage()
+    }
+
+}
+
+/// Only the file URL and dimensions escape the engine queue. The 16-bit
+/// CGImage (and the spk_result it owns) must be released on that queue.
+private struct ExportOutcome: Sendable {
+    let url: URL
+    let width: Int
+    let height: Int
 }
 
 /// RAW 原始文件字节（ARW/CR3/DNG…）。优先按 `rawImage` 取原始数据；普通照片
